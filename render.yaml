@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: pr-guard-backend
+    env: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GITHUB_WEBHOOK_SECRET
+        generateValue: true
+      - key: GITHUB_APP_ID
+        sync: false
+      - key: GITHUB_PRIVATE_KEY
+        sync: false
+      - key: BACKEND_CALLBACK_URL
+        sync: false

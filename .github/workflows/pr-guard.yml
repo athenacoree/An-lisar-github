@@ -1,0 +1,222 @@
+name: PR-Guard Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Pull Request Number'
+        required: true
+        type: string
+      commit_sha:
+        description: 'PR Commit SHA'
+        required: true
+        type: string
+      callback_url:
+        description: 'PR-Guard Backend Callback API Endpoint'
+        required: true
+        type: string
+      installation_id:
+        description: 'GitHub App Installation ID'
+        required: false
+        type: string
+
+jobs:
+  pr-guard-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout PR Code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Fetch PR Diff
+        id: pr_diff
+        run: |
+          PR_NUM="${{ inputs.pr_number }}"
+          echo "Fetching diff for PR #${PR_NUM}..."
+
+          # Fetch PR diff using GitHub API with GITHUB_TOKEN header
+          DIFF_CONTENT=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3.diff" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUM}")
+
+          # Save diff to a file
+          echo "$DIFF_CONTENT" > pr_diff.txt
+          echo "Diff fetched successfully. Lines: $(wc -l < pr_diff.txt)"
+
+      - name: Run Deterministic PR-Guard Analysis
+        id: run_guard
+        run: |
+          # Create standalone runner script if node_modules not installed in repo
+          cat << 'EOF' > run_analysis.js
+          const fs = require('fs');
+          const https = require('https');
+
+          const diffText = fs.readFileSync('pr_diff.txt', 'utf8');
+
+          function parseDiffAddedLines(diff) {
+            const addedLines = [];
+            const lines = diff.split('\n');
+            let currentFile = '';
+            let lineNum = 0;
+
+            for (const line of lines) {
+              if (line.startsWith('+++ b/')) {
+                currentFile = line.substring(6).trim();
+                continue;
+              }
+              if (line.startsWith('@@ ')) {
+                const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+                if (match) lineNum = parseInt(match[1], 10);
+                continue;
+              }
+              if (!currentFile) continue;
+
+              if (line.startsWith('+') && !line.startsWith('+++')) {
+                addedLines.push({ file: currentFile, line: lineNum, content: line.substring(1) });
+                lineNum++;
+              } else if (!line.startsWith('-')) {
+                lineNum++;
+              }
+            }
+            return addedLines;
+          }
+
+          const PLACEHOLDERS = [
+            { pattern: /\bTODO\b/i, name: 'TODO' },
+            { pattern: /\bCHANGEME\b/i, name: 'CHANGEME' },
+            { pattern: /\bFIXME\b/i, name: 'FIXME' },
+            { pattern: /\bXXX\b/i, name: 'XXX' },
+            { pattern: /test@test\.com/i, name: 'test@test.com' },
+            { pattern: /example@example\.com/i, name: 'example@example.com' }
+          ];
+
+          const addedLines = parseDiffAddedLines(diffText);
+          const issues = [];
+
+          // Placeholder Check
+          for (const item of addedLines) {
+            for (const ph of PLACEHOLDERS) {
+              if (ph.pattern.test(item.content)) {
+                issues.push({
+                  rule: 'placeholder',
+                  severity: 'warning',
+                  message: `Unresolved placeholder found: '${ph.name}'`,
+                  file: item.file,
+                  line: item.line,
+                  snippet: item.content.trim()
+                });
+              }
+            }
+          }
+
+          // Extract packages for phantom check
+          const NODE_BUILTINS = new Set([
+            'assert', 'async_hooks', 'buffer', 'child_process', 'cluster', 'console',
+            'constants', 'crypto', 'dgram', 'dns', 'domain', 'events', 'fs', 'http',
+            'http2', 'https', 'inspector', 'module', 'net', 'os', 'path', 'perf_hooks',
+            'process', 'punycode', 'querystring', 'readline', 'repl', 'stream',
+            'string_decoder', 'sys', 'timers', 'tls', 'tty', 'url', 'util',
+            'v8', 'vm', 'worker_threads', 'zlib'
+          ]);
+
+          const packagesToCheck = [];
+          for (const item of addedLines) {
+            if (/\.(js|jsx|ts|tsx|mjs|cjs)$/.test(item.file)) {
+              const impMatch = item.content.match(/(?:import\s+(?:[\s\S]*?\s+from\s+)?|require\s*\(\s*)['"]([^'"]+)['"]/);
+              if (impMatch) {
+                const rawName = impMatch[1];
+                if (!rawName.startsWith('.') && !rawName.startsWith('/') && !NODE_BUILTINS.has(rawName)) {
+                  let pkgName = rawName;
+                  if (rawName.startsWith('@')) {
+                    const parts = rawName.split('/');
+                    if (parts.length >= 2) pkgName = `${parts[0]}/${parts[1]}`;
+                  } else {
+                    pkgName = rawName.split('/')[0];
+                  }
+                  packagesToCheck.push({ registry: 'npm', name: pkgName, file: item.file, line: item.line, snippet: item.content.trim() });
+                }
+              }
+            }
+          }
+
+          function checkRegistry(pkg) {
+            return new Promise((resolve) => {
+              const encoded = encodeURIComponent(pkg.name);
+              https.get(`https://registry.npmjs.org/${encoded}`, { headers: { 'User-Agent': 'PR-Guard-Workflow/1.0' } }, (res) => {
+                if (res.statusCode === 404) {
+                  issues.push({
+                    rule: 'phantom-package',
+                    severity: 'critical',
+                    message: `Phantom package detected: '${pkg.name}' does not exist on npm registry!`,
+                    file: pkg.file,
+                    line: pkg.line,
+                    snippet: pkg.snippet
+                  });
+                }
+                resolve();
+              }).on('error', () => resolve());
+            });
+          }
+
+          async function main() {
+            for (const pkg of packagesToCheck) {
+              await checkRegistry(pkg);
+            }
+
+            const criticalCount = issues.filter(i => i.severity === 'critical').length;
+            const warningCount = issues.filter(i => i.severity === 'warning').length;
+
+            const payload = {
+              results: {
+                summary: {
+                  criticalCount,
+                  warningCount,
+                  passed: criticalCount === 0
+                },
+                issues
+              }
+            };
+
+            fs.writeFileSync('results.json', JSON.stringify(payload, null, 2));
+            console.log('Analysis complete. Summary:', payload.results.summary);
+          }
+
+          main();
+          EOF
+          node run_analysis.js
+
+      - name: Send Results Back to PR-Guard Backend
+        run: |
+          REPO_FULL="${{ github.repository }}"
+          OWNER=$(echo "$REPO_FULL" | cut -d'/' -f1)
+          REPO=$(echo "$REPO_FULL" | cut -d'/' -f2)
+
+          CALLBACK_URL="${{ inputs.callback_url }}"
+          PR_NUM="${{ inputs.pr_number }}"
+          INST_ID="${{ inputs.installation_id }}"
+          COMMIT_SHA="${{ inputs.commit_sha }}"
+
+          # Merge payload details
+          node -e '
+            const fs = require("fs");
+            const data = JSON.parse(fs.readFileSync("results.json", "utf8"));
+            data.owner = process.argv[1];
+            data.repo = process.argv[2];
+            data.prNumber = parseInt(process.argv[3], 10);
+            data.installationId = process.argv[4] ? parseInt(process.argv[4], 10) : undefined;
+            data.commitSha = process.argv[5];
+            fs.writeFileSync("payload.json", JSON.stringify(data));
+          ' "$OWNER" "$REPO" "$PR_NUM" "$INST_ID" "$COMMIT_SHA"
+
+          echo "Posting results to ${CALLBACK_URL}..."
+          curl -X POST -H "Content-Type: application/json" -d @payload.json "$CALLBACK_URL"

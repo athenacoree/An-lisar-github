@@ -1,0 +1,41 @@
+{
+  "name": "pr-guard",
+  "version": "1.0.0",
+  "description": "Deterministic GitHub PR Guard bot - automated PR review without AI/LLM",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "ts-node src/server.ts",
+    "test": "jest",
+    "check:phantom": "ts-node scripts/check-phantom.ts",
+    "check:placeholders": "ts-node scripts/check-placeholders.ts"
+  },
+  "keywords": [
+    "github-app",
+    "pr-checker",
+    "deterministic",
+    "code-review"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@octokit/auth-app": "^7.1.0",
+    "@octokit/rest": "^21.0.0",
+    "@octokit/webhooks": "^13.0.0",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.10.2",
+    "@types/supertest": "^6.0.2",
+    "jest": "^29.7.0",
+    "supertest": "^7.0.0",
+    "ts-jest": "^29.2.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
+  }
+}
