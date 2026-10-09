@@ -41,9 +41,11 @@ app.post('/webhook', async (req, res) => {
       const repo = repository.name;
       const headSha = req.body.pull_request.head.sha;
       const installationId = req.body.installation?.id;
+      const isFork = req.body.pull_request?.head?.repo?.fork === true ||
+                     (req.body.pull_request?.head?.repo?.full_name && req.body.pull_request.head.repo.full_name !== repository.full_name);
 
       try {
-        console.log(`Received PR #${prNumber} on ${owner}/${repo} (Action: ${action}). Triggering workflow_dispatch...`);
+        console.log(`Received PR #${prNumber} on ${owner}/${repo} (Action: ${action}, Fork: ${isFork}). Triggering workflow_dispatch...`);
 
         await triggerWorkflowDispatch({
           owner,
@@ -57,11 +59,16 @@ app.post('/webhook', async (req, res) => {
           message: 'Workflow dispatch triggered successfully',
           owner,
           repo,
-          prNumber
+          prNumber,
+          isFork
         });
       } catch (err: any) {
         console.error('Failed to trigger workflow dispatch:', err.message);
-        return res.status(500).json({ error: 'Failed to trigger analysis workflow', details: err.message });
+        return res.status(200).json({
+          message: 'Webhook received, but workflow dispatch could not be completed (e.g. fork PR or permission restricted)',
+          details: err.message,
+          isFork
+        });
       }
     }
   }

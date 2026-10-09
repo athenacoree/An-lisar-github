@@ -38,6 +38,13 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Install dependencies & compile PR-Guard
+        run: |
+          if [ -f "package.json" ]; then
+            npm ci || npm install
+            npm run build
+          fi
+
       - name: Fetch PR Diff
         id: pr_diff
         run: |
@@ -56,144 +63,31 @@ jobs:
       - name: Run Deterministic PR-Guard Analysis
         id: run_guard
         run: |
-          # Create standalone runner script if node_modules not installed in repo
-          cat << 'EOF' > run_analysis.js
-          const fs = require('fs');
-          const https = require('https');
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
 
-          const diffText = fs.readFileSync('pr_diff.txt', 'utf8');
+            async function main() {
+              const diffText = fs.readFileSync("pr_diff.txt", "utf8");
+              let runAnalysis;
 
-          function parseDiffAddedLines(diff) {
-            const addedLines = [];
-            const lines = diff.split('\n');
-            let currentFile = '';
-            let lineNum = 0;
-
-            for (const line of lines) {
-              if (line.startsWith('+++ b/')) {
-                currentFile = line.substring(6).trim();
-                continue;
+              if (fs.existsSync("./dist/checker/index.js")) {
+                runAnalysis = require("./dist/checker").runAnalysis;
+              } else {
+                console.error("Compiled checker not found in dist/checker");
+                process.exit(1);
               }
-              if (line.startsWith('@@ ')) {
-                const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-                if (match) lineNum = parseInt(match[1], 10);
-                continue;
-              }
-              if (!currentFile) continue;
 
-              if (line.startsWith('+') && !line.startsWith('+++')) {
-                addedLines.push({ file: currentFile, line: lineNum, content: line.substring(1) });
-                lineNum++;
-              } else if (!line.startsWith('-')) {
-                lineNum++;
-              }
+              const results = await runAnalysis(diffText, process.cwd());
+              fs.writeFileSync("results.json", JSON.stringify({ results }, null, 2));
+              console.log("Analysis complete. Summary:", results.summary);
             }
-            return addedLines;
-          }
 
-          const PLACEHOLDERS = [
-            { pattern: /\bTODO\b/i, name: 'TODO' },
-            { pattern: /\bCHANGEME\b/i, name: 'CHANGEME' },
-            { pattern: /\bFIXME\b/i, name: 'FIXME' },
-            { pattern: /\bXXX\b/i, name: 'XXX' },
-            { pattern: /test@test\.com/i, name: 'test@test.com' },
-            { pattern: /example@example\.com/i, name: 'example@example.com' }
-          ];
-
-          const addedLines = parseDiffAddedLines(diffText);
-          const issues = [];
-
-          // Placeholder Check
-          for (const item of addedLines) {
-            for (const ph of PLACEHOLDERS) {
-              if (ph.pattern.test(item.content)) {
-                issues.push({
-                  rule: 'placeholder',
-                  severity: 'warning',
-                  message: `Unresolved placeholder found: '${ph.name}'`,
-                  file: item.file,
-                  line: item.line,
-                  snippet: item.content.trim()
-                });
-              }
-            }
-          }
-
-          // Extract packages for phantom check
-          const NODE_BUILTINS = new Set([
-            'assert', 'async_hooks', 'buffer', 'child_process', 'cluster', 'console',
-            'constants', 'crypto', 'dgram', 'dns', 'domain', 'events', 'fs', 'http',
-            'http2', 'https', 'inspector', 'module', 'net', 'os', 'path', 'perf_hooks',
-            'process', 'punycode', 'querystring', 'readline', 'repl', 'stream',
-            'string_decoder', 'sys', 'timers', 'tls', 'tty', 'url', 'util',
-            'v8', 'vm', 'worker_threads', 'zlib'
-          ]);
-
-          const packagesToCheck = [];
-          for (const item of addedLines) {
-            if (/\.(js|jsx|ts|tsx|mjs|cjs)$/.test(item.file)) {
-              const impMatch = item.content.match(/(?:import\s+(?:[\s\S]*?\s+from\s+)?|require\s*\(\s*)['"]([^'"]+)['"]/);
-              if (impMatch) {
-                const rawName = impMatch[1];
-                if (!rawName.startsWith('.') && !rawName.startsWith('/') && !NODE_BUILTINS.has(rawName)) {
-                  let pkgName = rawName;
-                  if (rawName.startsWith('@')) {
-                    const parts = rawName.split('/');
-                    if (parts.length >= 2) pkgName = `${parts[0]}/${parts[1]}`;
-                  } else {
-                    pkgName = rawName.split('/')[0];
-                  }
-                  packagesToCheck.push({ registry: 'npm', name: pkgName, file: item.file, line: item.line, snippet: item.content.trim() });
-                }
-              }
-            }
-          }
-
-          function checkRegistry(pkg) {
-            return new Promise((resolve) => {
-              const encoded = encodeURIComponent(pkg.name);
-              https.get(`https://registry.npmjs.org/${encoded}`, { headers: { 'User-Agent': 'PR-Guard-Workflow/1.0' } }, (res) => {
-                if (res.statusCode === 404) {
-                  issues.push({
-                    rule: 'phantom-package',
-                    severity: 'critical',
-                    message: `Phantom package detected: '${pkg.name}' does not exist on npm registry!`,
-                    file: pkg.file,
-                    line: pkg.line,
-                    snippet: pkg.snippet
-                  });
-                }
-                resolve();
-              }).on('error', () => resolve());
+            main().catch(err => {
+              console.error("Analysis failed:", err);
+              process.exit(1);
             });
-          }
-
-          async function main() {
-            for (const pkg of packagesToCheck) {
-              await checkRegistry(pkg);
-            }
-
-            const criticalCount = issues.filter(i => i.severity === 'critical').length;
-            const warningCount = issues.filter(i => i.severity === 'warning').length;
-
-            const payload = {
-              results: {
-                summary: {
-                  criticalCount,
-                  warningCount,
-                  passed: criticalCount === 0
-                },
-                issues
-              }
-            };
-
-            fs.writeFileSync('results.json', JSON.stringify(payload, null, 2));
-            console.log('Analysis complete. Summary:', payload.results.summary);
-          }
-
-          main();
-          EOF
-          node run_analysis.js
+          '
 
       - name: Send Results Back to PR-Guard Backend
         run: |
@@ -219,4 +113,7 @@ jobs:
           ' "$OWNER" "$REPO" "$PR_NUM" "$INST_ID" "$COMMIT_SHA"
 
           echo "Posting results to ${CALLBACK_URL}..."
-          curl -X POST -H "Content-Type: application/json" -d @payload.json "$CALLBACK_URL"
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d @payload.json "$CALLBACK_URL"
